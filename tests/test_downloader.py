@@ -38,12 +38,14 @@ def bypass_proxy_for_local_server(monkeypatch):
 
 
 @contextmanager
-def hub(files=None, *, faults=(), no_range=False, corrupt=False, auth_error=False, metadata_stall=False):
+def hub(files=None, *, faults=(), no_range=False, corrupt=False, auth_error=False, metadata_stall=False,
+        sync_requests=0):
     files = files if files is not None else {"weights.bin": PAYLOAD, "config.json": b'{"ok":true}', "empty": b""}
     state = {"faults": list(faults), "ranges": [], "resolve": 0, "active": 0,
              "max_active": 0, "cdn_auth": [], "metadata": 0,
-             "stalled": threading.Event(), "release": threading.Event()}
+             "stalled": threading.Event(), "release": threading.Event(), "arrivals": 0}
     lock = threading.Lock()
+    barrier = threading.Barrier(sync_requests, timeout=5) if sync_requests else None
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -102,8 +104,11 @@ def hub(files=None, *, faults=(), no_range=False, corrupt=False, auth_error=Fals
                         state["faults"].pop(0)
                     state["active"] += 1
                     state["max_active"] = max(state["max_active"], state["active"])
+                    state["arrivals"] += 1
+                    synchronize = barrier is not None and state["arrivals"] <= sync_requests
                 try:
-                    time.sleep(0.02)  # Make overlapping requests observable and deterministic.
+                    if synchronize:
+                        barrier.wait()
                     if fault in ("expired", "rate-limit", "server-error"):
                         self.send({"expired": 403, "rate-limit": 429, "server-error": 503}[fault],
                                   headers={"Retry-After": "0"})
@@ -184,7 +189,7 @@ def downloader(tmp_path, endpoint, extra=()):
 
 
 def test_download_multisegment_hash_and_empty(tmp_path):
-    with hub() as (endpoint, state):
+    with hub(sync_requests=2) as (endpoint, state):
         task = downloader(tmp_path, endpoint, ["--token", "private-test-token"])
         task.run()
     assert (tmp_path / "weights.bin").read_bytes() == PAYLOAD
@@ -214,8 +219,13 @@ def test_resume_partial_after_restart_and_skip_completed(tmp_path):
         task = downloader(tmp_path, endpoint)
         task.state.mkdir(parents=True)
         file = task.metadata()[0]
-        parts = task.part_dir(file)
-        (parts / "00000000.part").write_bytes(PAYLOAD[:54321])
+        partial = hf.PartialFile(task.file_state_dir(file), file.size, file.digest, 1024 * 1024)
+        try:
+            with partial.path.open("r+b", buffering=0) as stream:
+                hf.write_all(stream, PAYLOAD[:54321])
+                partial.checkpoint(partial.segments[0], stream, 54321, hashlib.sha256(PAYLOAD[:54321]))
+        finally:
+            partial.close()
         task = downloader(tmp_path, endpoint)
         task.run()
         assert "bytes=54321-1048575" in state["ranges"]
@@ -419,7 +429,12 @@ raise SystemExit(hf.main(sys.argv[2:]))
             assert proc.returncode == 130, (stdout, stderr)
             assert elapsed < (3 if twice else 8)
             assert "正在停止" in stderr.decode("utf-8")
-            assert "强制停止" in stderr.decode("utf-8")
+            if stage == "metadata":
+                assert "强制停止" in stderr.decode("utf-8")
+            else:
+                # SIGINT may arrive between read1 calls; a cooperative exit is
+                # also correct, even before the second cancellation is handled.
+                assert any(message in stderr.decode("utf-8") for message in ("强制停止", "已停止"))
             assert not marker.exists()
             if stage == "body":
                 assert any(p.stat().st_size == hf.BUFFER for p in (tmp_path / ".hf-download").rglob("*.incomplete"))
@@ -453,7 +468,7 @@ def test_slow_and_stalled_connections_are_replaced(tmp_path, fault, extra):
 
 
 def test_tail_is_split_among_idle_workers(tmp_path):
-    with hub({"weights.bin": PAYLOAD}) as (endpoint, state):
+    with hub({"weights.bin": PAYLOAD}, sync_requests=2) as (endpoint, state):
         task = downloader(tmp_path, endpoint, ["--chunk-size", "4"])
         task.run()
     assert state["max_active"] > 1
@@ -469,7 +484,7 @@ def test_full_length_temporary_file_is_not_treated_as_complete(tmp_path):
         task = downloader(tmp_path, endpoint)
         task.state.mkdir(parents=True)
         file = task.metadata()[0]
-        directory = task.part_dir(file)
+        directory = task.file_state_dir(file)
         partial = hf.PartialFile(directory, file.size, file.digest, 1024 * 1024)
         with partial.path.open("r+b") as stream:
             stream.truncate(file.size)
@@ -479,28 +494,18 @@ def test_full_length_temporary_file_is_not_treated_as_complete(tmp_path):
     assert (tmp_path / "weights.bin").read_bytes() == PAYLOAD
 
 
-def test_legacy_migration_survives_interruption_before_source_delete(tmp_path, monkeypatch):
+def test_obsolete_cache_files_are_neither_used_nor_deleted(tmp_path):
     with hub({"weights.bin": PAYLOAD}) as (endpoint, state):
         task = downloader(tmp_path, endpoint)
         task.state.mkdir(parents=True)
         file = task.metadata()[0]
-        directory = task.part_dir(file)
-        legacy = directory / "00000000.part"
-        legacy.write_bytes(PAYLOAD[:54321])
-        original = hf.PartialFile.checkpoint
-
-        def checkpoint_then_stop(*args):
-            original(*args)
-            raise hf.Cancelled()
-
-        with monkeypatch.context() as patch:
-            patch.setattr(hf.PartialFile, "checkpoint", checkpoint_then_stop)
-            with pytest.raises(hf.Cancelled):
-                task.run()
-        assert legacy.exists()
-        downloader(tmp_path, endpoint).run()
-        assert not legacy.exists()
-        assert "bytes=54321-1048575" in state["ranges"]
+        directory = task.file_state_dir(file)
+        obsolete = [directory / name for name in ("00000000.part", "full.part", "assembled.tmp")]
+        for old in obsolete:
+            old.write_bytes(b"obsolete cache")
+        task.run()
+        assert all(old.read_bytes() == b"obsolete cache" for old in obsolete)
+        assert "bytes=0-1048575" in state["ranges"]
         assert (tmp_path / "weights.bin").read_bytes() == PAYLOAD
 
 
@@ -546,7 +551,7 @@ def test_corrupt_resumed_range_is_redownloaded_without_losing_good_ranges(tmp_pa
         task = downloader(tmp_path, endpoint)
         task.state.mkdir(parents=True)
         file = task.metadata()[0]
-        partial = hf.PartialFile(task.part_dir(file), file.size, file.digest, 1024 * 1024)
+        partial = hf.PartialFile(task.file_state_dir(file), file.size, file.digest, 1024 * 1024)
         with partial.path.open("r+b", buffering=0) as stream:
             for segment in partial.segments[:2]:
                 block = PAYLOAD[segment.start:segment.end]

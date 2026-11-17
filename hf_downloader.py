@@ -538,58 +538,12 @@ class Downloader:
         finally:
             self.progress.end_phase(task_id)
 
-    def part_dir(self, file: RemoteFile) -> Path:
-        # Keep the old directory key so existing .part downloads can be migrated.
+    def file_state_dir(self, file: RemoteFile) -> Path:
+        # Stable identity for the temporary file and its range journal.
         identity = json.dumps([self.args.repo, self.commit, file.name, file.digest, self.args.chunk_size])
         path = self.state / hashlib.sha256(identity.encode()).hexdigest()
         path.mkdir(exist_ok=True)
         return path
-
-    def migrate_parts(self, file: RemoteFile, partial: PartialFile, directory: Path):
-        block_size = self.args.chunk_size * 1024 * 1024
-        full = directory / "full.part"
-        sources = []
-        if full.exists():
-            if partial.ranged:
-                partial.reset(full=True)
-            if partial.segments:
-                sources = [(full, partial.segments[0])]
-        else:
-            segments = {part.start: part for part in partial.segments}
-            for old in sorted(directory.glob("*.part")):
-                if re.fullmatch(r"[0-9]{8}\.part", old.name):
-                    segment = segments.get(int(old.stem) * block_size)
-                    if segment:
-                        sources.append((old, segment))
-        if not sources:
-            return
-        phase = self.progress.begin_phase(f"迁移旧缓存 {file.name}", sum(p.stat().st_size for p, _ in sources))
-        self.progress.note(f"迁移旧分块 {file.name}")
-        try:
-            with partial.path.open("r+b", buffering=0) as output:
-                for old, segment in sources:
-                    self.check_stop()
-                    length = old.stat().st_size
-                    if length > segment.length:
-                        raise DownloadError(f"旧分块大小异常：{old.name}，请保留缓存检查")
-                    if segment.done < length:
-                        output.seek(segment.start)
-                        hasher, copied = hashlib.sha256(), 0
-                        with old.open("rb") as stream:
-                            while block := stream.read(BUFFER):
-                                self.check_stop()
-                                write_all(output, block)
-                                hasher.update(block)
-                                copied += len(block)
-                                self.progress.advance_phase(phase, len(block))
-                        partial.checkpoint(segment, output, copied, hasher)
-                    else:
-                        self.progress.advance_phase(phase, length)
-                    # A crash before this unlink just causes the source to be
-                    # reconsidered; its destination checkpoint is already durable.
-                    old.unlink()
-        finally:
-            self.progress.end_phase(phase)
 
     def download_segment(self, file: RemoteFile, partial: PartialFile, segment: Segment,
                          cancelled: threading.Event):
@@ -718,7 +672,7 @@ class Downloader:
             self.progress.add(file.size)
             self.progress.file_finished()
             return
-        directory = self.part_dir(file)
+        directory = self.file_state_dir(file)
         partial = PartialFile(directory, file.size, file.digest, self.args.chunk_size * 1024 * 1024)
         try:
             phase = self.progress.begin_phase(f"恢复校验 {file.name}", sum(s.done for s in partial.segments))
@@ -726,7 +680,6 @@ class Downloader:
                 partial.restore(self.check_stop, lambda n: self.progress.advance_phase(phase, n))
             finally:
                 self.progress.end_phase(phase)
-            self.migrate_parts(file, partial, directory)
             # A pre-existing incomplete file may have a stale longer tail. Only
             # journaled prefixes count towards progress, never its logical size.
             with partial.path.open("r+b") as stream:
@@ -746,7 +699,6 @@ class Downloader:
                 self.progress.note(f"完整校验 {file.name}")
                 if self.hash_file(partial.path, file):
                     partial.path.replace(target)
-                    (directory / "assembled.tmp").unlink(missing_ok=True)
                     self.progress.file_finished()
                     return
                 self.progress.add(-sum(s.done for s in partial.segments))

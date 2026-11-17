@@ -82,8 +82,7 @@ class PartialFile:
             if not row or row[0] not in ("range", "full"):
                 raise ValueError("续传模式记录损坏")
             self.ranged = row[0] == "range"
-            # Do not preallocate: migrations can copy and remove one legacy part
-            # at a time, and file size must never be used as completion evidence.
+            # Grow on writes; file size is never used as completion evidence.
             self.path.touch(exist_ok=True)
         except BaseException:
             self.db.close()
