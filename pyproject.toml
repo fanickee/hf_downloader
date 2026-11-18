@@ -5,6 +5,7 @@ description = "支持断点续传、自动重试和多线程的 Hugging Face 模
 requires-python = ">=3.11"
 dependencies = [
     "rich>=14.1,<15",
+    "truststore>=0.10.4,<1",
 ]
 
 [project.scripts]

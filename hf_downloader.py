@@ -19,15 +19,19 @@ from pathlib import Path, PurePosixPath
 import random
 import re
 import signal
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 import uuid
+
+import truststore
 
 from rich.console import Console
 from rich.progress import (
@@ -184,6 +188,33 @@ class Retryable(Exception):
 
 class NoRange(Exception):
     pass
+
+
+def network_error_message(error: Exception) -> str:
+    """Explain failures without exposing signed URLs, proxy passwords or tokens."""
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        code = getattr(reason, "verify_code", None)
+        if code == 10:
+            return "TLS 证书已过期（校验错误码 10），请检查系统时间、站点或 HTTPS 代理证书"
+        if code == 9:
+            return "TLS 证书尚未生效（校验错误码 9），请检查系统时间和证书有效期"
+        suffix = f"（校验错误码 {code}）" if isinstance(code, int) else ""
+        return f"TLS 证书验证失败{suffix}，请检查站点、代理证书或受信任证书配置"
+    if isinstance(reason, socket.gaierror):
+        return "DNS 解析失败，请检查网络、DNS 或代理设置"
+    if isinstance(reason, TimeoutError):
+        return "连接或读取超时"
+    if isinstance(reason, ConnectionRefusedError):
+        return "服务器或代理拒绝连接"
+    if isinstance(reason, ConnectionResetError):
+        return "连接被对端重置"
+    if isinstance(reason, ssl.SSLError):
+        return "TLS 握手或加密连接失败"
+    if isinstance(reason, str) and reason.startswith("Tunnel connection failed:"):
+        match = re.match(r"Tunnel connection failed:\s*(\d{3})\b", reason)
+        return "代理隧道建立失败" + (f"（HTTP {match[1]}）" if match else "")
+    return f"网络不可用（{type(reason).__name__}）"
 
 
 class SafeRedirect(HTTPRedirectHandler):
@@ -416,7 +447,8 @@ class Downloader:
     def open(self, url: str, headers: dict | None = None):
         self.check_stop()
         if not hasattr(self.local, "opener"):
-            self.local.opener = build_opener(SafeRedirect())
+            context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            self.local.opener = build_opener(SafeRedirect(), HTTPSHandler(context=context))
         request_headers = {"User-Agent": "hf-resilient-downloader/0.1", "Accept-Encoding": "identity",
                            "Cache-Control": "no-cache"}
         if self.args.token:
@@ -450,8 +482,8 @@ class Downloader:
                         delay = 0
                 raise Retryable(f"HTTP {status}，刷新下载链接", max(0, delay)) from None
             raise DownloadError(f"请求失败：HTTP {status}") from None
-        except (URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
-            raise Retryable(f"网络不可用 ({type(exc).__name__})") from None
+        except (URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise Retryable(network_error_message(exc)) from None
 
     def metadata(self) -> list[RemoteFile]:
         identity = {"repo": self.args.repo, "revision": self.args.revision, "endpoint": self.args.endpoint}
@@ -704,7 +736,7 @@ class Downloader:
                 self.progress.add(-sum(s.done for s in partial.segments))
                 partial.reset()
                 self.progress.log(f"校验失败，重新下载：{file.name}（{integrity_attempt + 1}/3）")
-            raise DownloadError(f"{file.name} 连续三次校验失败，已停止；不会执行休眠")
+            raise DownloadError(f"{file.name} 连续三次校验失败，已停止；不会执行睡眠或休眠")
         finally:
             partial.close()
 
@@ -748,8 +780,8 @@ def keep_awake():
             ctypes.windll.kernel32.SetThreadExecutionState(previous)
 
 
-def hibernate(stop: threading.Event, seconds: int, interrupts=lambda: 0):
-    print(f"全部下载完成，{seconds} 秒后系统休眠；按 Ctrl+C 可取消。", flush=True)
+def power_countdown(stop: threading.Event, seconds: int, action: str, interrupts=lambda: 0):
+    print(f"全部下载完成，{seconds} 秒后系统{action}；按 Ctrl+C 可取消。", flush=True)
     deadline = time.monotonic() + seconds
     while True:
         if stop.is_set() or interrupts():
@@ -760,6 +792,84 @@ def hibernate(stop: threading.Event, seconds: int, interrupts=lambda: 0):
             break
         # Finite waits let Python dispatch console signals on Windows.
         time.sleep(min(0.1, remaining))
+
+
+def windows_sleep():
+    """Request standby with the process's existing shutdown privilege, then restore it."""
+    from ctypes import wintypes
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        # Exactly one LUID_AND_ATTRIBUTES entry is needed.
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", LUID),
+                    ("Attributes", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    power = ctypes.WinDLL("powrprof", use_last_error=True)
+    kernel.GetCurrentProcess.argtypes = []
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    security.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    security.OpenProcessToken.restype = wintypes.BOOL
+    security.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                               ctypes.POINTER(LUID)]
+    security.LookupPrivilegeValueW.restype = wintypes.BOOL
+    security.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL,
+                                               ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
+                                               ctypes.POINTER(TOKEN_PRIVILEGES),
+                                               ctypes.POINTER(wintypes.DWORD)]
+    security.AdjustTokenPrivileges.restype = wintypes.BOOL
+    power.SetSuspendState.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ubyte]
+    power.SetSuspendState.restype = ctypes.c_ubyte
+    token = wintypes.HANDLE()
+    # TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY; this does not elevate the process.
+    if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x0020 | 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    previous = TOKEN_PRIVILEGES()
+    try:
+        requested = TOKEN_PRIVILEGES()
+        requested.PrivilegeCount = 1
+        requested.Attributes = 0x00000002  # SE_PRIVILEGE_ENABLED
+        if not security.LookupPrivilegeValueW(None, "SeShutdownPrivilege", ctypes.byref(requested.Luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        size = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        if not security.AdjustTokenPrivileges(token, False, ctypes.byref(requested),
+                                               ctypes.sizeof(previous), ctypes.byref(previous),
+                                               ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        error = ctypes.get_last_error()
+        if error:
+            raise ctypes.WinError(error)  # Includes ERROR_NOT_ALL_ASSIGNED (1300).
+        # FALSE means sleep, not hibernation; keep wake events enabled.
+        if not power.SetSuspendState(False, False, False):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        try:
+            if previous.PrivilegeCount:
+                if not security.AdjustTokenPrivileges(token, False, ctypes.byref(previous), 0, None, None):
+                    raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.CloseHandle(token)
+
+
+def sleep_system(stop: threading.Event, seconds: int, interrupts=lambda: 0):
+    power_countdown(stop, seconds, "睡眠", interrupts)
+    if sys.platform == "win32":
+        windows_sleep()
+    elif sys.platform.startswith("linux"):
+        subprocess.run(["systemctl", "suspend"], check=True)
+    else:
+        raise DownloadError("此系统暂不支持自动睡眠")
+
+
+def hibernate(stop: threading.Event, seconds: int, interrupts=lambda: 0):
+    power_countdown(stop, seconds, "休眠", interrupts)
     if sys.platform == "win32":
         subprocess.run(["shutdown.exe", "/h"], check=True)
     elif sys.platform.startswith("linux"):
@@ -807,7 +917,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--retry-base", type=positive_float, default=2, help="初始重试间隔秒数，默认 2")
     result.add_argument("--retry-max", type=positive_float, default=60, help="重试退避上限秒数，默认 60")
     result.add_argument("--refresh", action="store_true", help="刷新固定版本；不加此参数会继续下载清单记录的版本")
-    result.add_argument("--hibernate", action="store_true", help="所有文件校验通过后自动休眠（Windows/Linux）")
+    power = result.add_mutually_exclusive_group()
+    power.add_argument("--sleep", action="store_true", help="所有文件校验通过后自动睡眠（Windows/Linux）")
+    power.add_argument("--hibernate", action="store_true", help="所有文件校验通过后自动休眠（Windows/Linux）")
+    result.add_argument("--sleep-delay", type=positive_int, default=60, help="睡眠倒计时秒数，默认 60")
     result.add_argument("--hibernate-delay", type=positive_int, default=60, help="休眠倒计时秒数，默认 60")
     result.add_argument("--quiet", action="store_true", help="隐藏动态进度，保留结果和错误")
     return result
@@ -826,8 +939,8 @@ def main(argv=None) -> int:
     endpoint = urlsplit(args.endpoint)
     if endpoint.scheme not in ("http", "https") or not endpoint.netloc or endpoint.query or endpoint.fragment or endpoint.username:
         cli.error("endpoint 必须是有效的 HTTP(S) 地址")
-    if args.hibernate and sys.platform != "win32" and not sys.platform.startswith("linux"):
-        cli.error("自动休眠目前仅支持 Windows/Linux")
+    if (args.sleep or args.hibernate) and sys.platform != "win32" and not sys.platform.startswith("linux"):
+        cli.error("自动睡眠/休眠目前仅支持 Windows/Linux")
     stop = threading.Event()
     previous = {}
     interrupt_count = 0
@@ -851,6 +964,8 @@ def main(argv=None) -> int:
             raise Cancelled()
         if args.hibernate:
             hibernate(stop, args.hibernate_delay, lambda: interrupt_count)
+        elif args.sleep:
+            sleep_system(stop, args.sleep_delay, lambda: interrupt_count)
         return 0
     except ForcedCancel:
         forced = True
